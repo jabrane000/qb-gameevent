@@ -14,6 +14,43 @@ local eventState = {
 local groupHash = nil
 local lastKillAt = {} -- [src] = timer (rate limit)
 
+-- ═══════════ STARTUP DIAGNOSTICS (v1.0.1) ═══════════
+local function safeCall(name, fn)
+    local ok, result = pcall(fn)
+    if not ok then
+        print(('^1[qb-gameevent] ERROR: native "%s" failed: %s^0'):format(name, tostring(result)))
+    end
+    return ok, result
+end
+
+AddEventHandler('onResourceStart', function(res)
+    if res ~= GetCurrentResourceName() then return end
+    CreateThread(function()
+        Wait(2000)
+        print('^2[qb-gameevent] ===== DIAGNOSTICS v1.0.1 =====^0')
+        local okPed, ped = safeCall('CreatePed', function()
+            return CreatePed(4, joaat('a_m_m_socenlat_01'), 0.0, 0.0, -1000.0, 0, true, true)
+        end)
+        if okPed and ped and ped ~= 0 then
+            print('^2[qb-gameevent] OK: CreatePed server-side works (OneSync OK)^0')
+            DeleteEntity(ped)
+        else
+            print('^1[qb-gameevent] FAIL: CreatePed server-side failed!^0')
+            print('^1  -> Check: `set onesync on` in server.cfg (no quotes) BEFORE any `ensure` line^0')
+            print('^1  -> Check: server artifacts 5181+ (txAdmin -> Dashboard -> version)^0')
+        end
+        local okGroup = safeCall('AddRelationshipGroup', function()
+            groupHash = AddRelationshipGroup('EVENT_TERRORISTS')
+            local playerGroup = GetHashKey('PLAYER')
+            SetRelationshipBetweenGroups(5, groupHash, playerGroup)
+            SetRelationshipBetweenGroups(5, playerGroup, groupHash)
+        end)
+        if okGroup then print('^2[qb-gameevent] OK: Relationship group created^0') end
+        print('^2[qb-gameevent] /gameevent command registered. If chat says "Access denied": add `add_principal group.admin qb-gameevent.command.gameevent` to server.cfg and restart.^0')
+        print('^2[qb-gameevent] ================================^0')
+    end)
+end)
+
 -- ═══════════ CLEANUP ═══════════
 local function cleanupPeds()
     for netId in pairs(eventState.pedNetIds) do
@@ -23,12 +60,12 @@ local function cleanupPeds()
     eventState.pedNetIds = {}
 end
 
--- ═══════════ RELATIONSHIP GROUP (NPCs hostile lel players) ═══════════
+-- ═══════════ RELATIONSHIP GROUP ═══════════
 local function getGroupHash()
     if groupHash then return groupHash end
     groupHash = AddRelationshipGroup('EVENT_TERRORISTS')
     local playerGroup = GetHashKey('PLAYER')
-    SetRelationshipBetweenGroups(5, groupHash, playerGroup) -- 5 = Hate
+    SetRelationshipBetweenGroups(5, groupHash, playerGroup)
     SetRelationshipBetweenGroups(5, playerGroup, groupHash)
     return groupHash
 end
@@ -51,20 +88,24 @@ local function spawnEventPeds()
         local x = eventState.coords.x + math.cos(angle) * dist
         local y = eventState.coords.y + math.sin(angle) * dist
 
-        local ped = CreatePed(4, modelHash, x, y, z, math.random(360), true, true)
-        if ped and ped ~= 0 then
+        local ok, ped = safeCall('CreatePed', function()
+            return CreatePed(4, modelHash, x, y, z, math.random(360), true, true)
+        end)
+        if ok and ped and ped ~= 0 then
             SetPedRelationshipGroupHash(ped, groupHash)
             GiveWeaponToPed(ped, weaponHash, 500, false, true)
             SetPedMaxHealth(ped, Config.NPCs.health)
             SetEntityHealth(ped, Config.NPCs.health)
             SetPedArmour(ped, Config.NPCs.armor or 0)
             SetPedAccuracy(ped, Config.NPCs.accuracy)
-            SetPedCombatAttributes(ped, 46, true)  -- always fight
-            SetPedCombatAttributes(ped, 5, true)   -- can use vehicles
-            SetPedFleeAttributes(ped, 0, false)     -- ma yferrech
+            SetPedCombatAttributes(ped, 46, true)
+            SetPedCombatAttributes(ped, 5, true)
+            SetPedFleeAttributes(ped, 0, false)
 
             eventState.npcTotal = eventState.npcTotal + 1
             eventState.pedNetIds[NetworkGetNetworkIdFromEntity(ped)] = true
+        else
+            print('^1[qb-gameevent] FAIL: NPC spawn failed - check OneSync + artifacts (see diagnostics)^0')
         end
     end
     return eventState.npcTotal
@@ -72,7 +113,6 @@ end
 
 -- ═══════════ REGISTER KILL (hardened) ═══════════
 local function registerKill(src)
-    -- [SECURITY] rate limit per player
     local now = GetGameTimer()
     if lastKillAt[src] and (now - lastKillAt[src]) < (Config.Security.killRateLimitMs or 400) then
         return
@@ -93,7 +133,6 @@ local function registerKill(src)
         eventState.participants[cid] = p
     end
 
-    -- [SECURITY] cap el kills per player
     if p.kills >= (Config.Security.maxKillsPerEvent or 50) then return end
     p.kills = p.kills + 1
 
@@ -105,7 +144,6 @@ function endEvent(reason)
     if not eventState.active then return end
     eventState.active = false
 
-    -- REWARDS (server-only)
     local best = nil
     for _, p in pairs(eventState.participants) do
         if not best or p.kills > best.kills then best = p end
@@ -138,19 +176,18 @@ function endEvent(reason)
     lastKillAt = {}
 end
 
--- ═══════════ KILL DETECTION (server-native, 0 client trust) ═══════════
+-- ═══════════ KILL DETECTION ═══════════
 AddEventHandler('entityDie', function(deadEntity)
     if not eventState.active or not DoesEntityExist(deadEntity) then return end
 
     local netId = NetworkGetNetworkIdFromEntity(deadEntity)
-    if not eventState.pedNetIds[netId] then return end -- mouch NPC mte3na
+    if not eventState.pedNetIds[netId] then return end
 
     eventState.pedNetIds[netId] = nil
     eventState.killed = eventState.killed + 1
 
     local killerPed = GetPedSourceOfDeath(deadEntity)
     if killerPed and killerPed ~= 0 then
-        -- [SECURITY] distance validation
         local victimCoords = GetEntityCoords(deadEntity)
         if #(GetEntityCoords(killerPed) - victimCoords) <= (Config.Security.maxKillDistance or 200.0) then
             for _, playerId in pairs(QBCore.Functions.GetPlayers()) do
@@ -171,7 +208,10 @@ end)
 
 -- ═══════════ START EVENT ═══════════
 local function startEvent()
-    if eventState.active then return end
+    if eventState.active then
+        print('[qb-gameevent] startEvent blocked: event already active')
+        return
+    end
 
     local loc = Config.Locations[math.random(#Config.Locations)]
     eventState.active = true
@@ -182,6 +222,13 @@ local function startEvent()
     eventState.startedAt = os.time()
 
     spawnEventPeds()
+
+    if eventState.npcTotal == 0 then
+        print('^1[qb-gameevent] START FAILED: 0 NPCs spawned - event aborted. Check diagnostics in console.^0')
+        eventState.active = false
+        eventState.coords = nil
+        return
+    end
 
     local pedNetIds = {}
     for netId in pairs(eventState.pedNetIds) do pedNetIds[netId] = true end
@@ -194,7 +241,8 @@ local function startEvent()
         pedNetIds = pedNetIds,
     })
 
-    print(('[qb-gameevent] Started at %s (%d NPCs)'):format(loc.label, eventState.npcTotal))
+    print(('^2[qb-gameevent] Event STARTED at %s (%d NPCs, %d players notified)^0'):format(
+        loc.label, eventState.npcTotal, #QBCore.Functions.GetPlayers()))
 
     SetTimeout((Config.Duration or 15) * 60 * 1000, function()
         if eventState.active then endEvent('Time up!') end
@@ -210,7 +258,7 @@ local function scheduleNext()
     SetTimeout(announceMin * 60 * 1000, function()
         if not eventState.active then
             TriggerClientEvent('qb-gameevent:client:announce', -1,
-                ('GAME EVENT fi %d min — 7ather rou7ek!'):format(Config.AnnounceBefore or 10))
+                ('GAME EVENT fi %d min - 7ather rou7ek!'):format(Config.AnnounceBefore or 10))
         end
     end)
 
@@ -245,6 +293,7 @@ QBCore.Commands.Add('gameevent', 'Game Event (start/stop)', {
     { name = 'action', help = 'start | stop' }
 }, true, function(source, args)
     local action = args[1]
+    print(('[qb-gameevent] /gameevent called by source %s, action=%s'):format(tostring(source), tostring(action)))
     if action == 'start' then
         if eventState.active then
             TriggerClientEvent('QBCore:Notify', source, 'Event deja active!', 'error', 5000)
@@ -253,10 +302,12 @@ QBCore.Commands.Add('gameevent', 'Game Event (start/stop)', {
         end
     elseif action == 'stop' then
         endEvent('Stopped by admin')
+    else
+        TriggerClientEvent('QBCore:Notify', source, 'Usage: /gameevent start|stop', 'error', 5000)
     end
 end, 'admin')
 
--- ═══════════ SAFETY: cleanup ki el resource yet7ebes ═══════════
+-- ═══════════ SAFETY ═══════════
 AddEventHandler('onResourceStop', function(res)
     if res == GetCurrentResourceName() then
         eventState.active = false
