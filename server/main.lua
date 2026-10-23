@@ -5,49 +5,59 @@ local eventState = {
     coords = nil,
     radius = nil,
     label = nil,
+    endsAt = 0,
     npcTotal = 0,
     killed = 0,
-    pedNetIds = {},    -- [netId] = true (NPCs mte3 el event)
-    participants = {}, -- [citizenid] = { kills, src, name }
+    pedNetIds = {},
+    participants = {},
     startedAt = 0,
 }
 local groupHash = nil
-local lastKillAt = {} -- [src] = timer (rate limit)
+local lastKillAt = {}
 
--- ═══════════ STARTUP DIAGNOSTICS (v1.0.1) ═══════════
+-- [v1.0.2] pcall guard: ken 7atta native ta3et, el event MA yo9ofch
 local function safeCall(name, fn)
-    local ok, result = pcall(fn)
+    local ok, a, b = pcall(fn)
     if not ok then
-        print(('^1[qb-gameevent] ERROR: native "%s" failed: %s^0'):format(name, tostring(result)))
+        print(('^1[qb-gameevent] native "%s" failed: %s^0'):format(name, tostring(a)))
     end
-    return ok, result
+    return ok, a, b
 end
 
+-- ═══════════ STARTUP DIAGNOSTICS ═══════════
 AddEventHandler('onResourceStart', function(res)
     if res ~= GetCurrentResourceName() then return end
     CreateThread(function()
         Wait(2000)
-        print('^2[qb-gameevent] ===== DIAGNOSTICS v1.0.1 =====^0')
+        print('^2[qb-gameevent] ===== DIAGNOSTICS v1.0.2 =====^0')
         local okPed, ped = safeCall('CreatePed', function()
             return CreatePed(4, joaat('a_m_m_socenlat_01'), 0.0, 0.0, -1000.0, 0, true, true)
         end)
+        local ready = false
         if okPed and ped and ped ~= 0 then
+            local t = 0
+            while t < 3000 and not DoesEntityExist(ped) do Wait(50) t = t + 50 end
+            ready = DoesEntityExist(ped)
+        end
+        if ready then
             print('^2[qb-gameevent] OK: CreatePed server-side works (OneSync OK)^0')
             DeleteEntity(ped)
         else
-            print('^1[qb-gameevent] FAIL: CreatePed server-side failed!^0')
-            print('^1  -> Check: `set onesync on` in server.cfg (no quotes) BEFORE any `ensure` line^0')
-            print('^1  -> Check: server artifacts 5181+ (txAdmin -> Dashboard -> version)^0')
+            print('^1[qb-gameevent] FAIL: CreatePed server-side (OneSync OFF or artifacts < 5181)^0')
+            print('^1  -> server.cfg: `set onesync on` BEFORE all ensure lines, then FULL restart^0')
+            print('^1  -> txAdmin: Settings -> OneSync -> Infinity -> Save -> Restart server^0')
         end
-        local okGroup = safeCall('AddRelationshipGroup', function()
-            groupHash = AddRelationshipGroup('EVENT_TERRORISTS')
-            local playerGroup = GetHashKey('PLAYER')
-            SetRelationshipBetweenGroups(5, groupHash, playerGroup)
-            SetRelationshipBetweenGroups(5, playerGroup, groupHash)
+        local okRel, _, gh = safeCall('AddRelationshipGroup', function()
+            return AddRelationshipGroup('EVENT_TERRORISTS')
         end)
-        if okGroup then print('^2[qb-gameevent] OK: Relationship group created^0') end
-        print('^2[qb-gameevent] /gameevent command registered. If chat says "Access denied": add `add_principal group.admin qb-gameevent.command.gameevent` to server.cfg and restart.^0')
-        print('^2[qb-gameevent] ================================^0')
+        if okRel and gh and gh ~= 0 then
+            groupHash = gh
+            print('^2[qb-gameevent] OK: Relationship group ready^0')
+        else
+            print('^3[qb-gameevent] NOTE: relationship natives not available server-side -> client fallback active^0')
+        end
+        print('^2[qb-gameevent] Command ready: /gameevent start — if "insufficient permissions" -> add `add_principal group.admin qb-gameevent.command.gameevent` to server.cfg^0')
+        print('^2[qb-gameevent] ===============================^0')
     end)
 end)
 
@@ -63,14 +73,23 @@ end
 -- ═══════════ RELATIONSHIP GROUP ═══════════
 local function getGroupHash()
     if groupHash then return groupHash end
-    groupHash = AddRelationshipGroup('EVENT_TERRORISTS')
-    local playerGroup = GetHashKey('PLAYER')
-    SetRelationshipBetweenGroups(5, groupHash, playerGroup)
-    SetRelationshipBetweenGroups(5, playerGroup, groupHash)
+    local ok, _, gh = safeCall('AddRelationshipGroup', function()
+        return AddRelationshipGroup('EVENT_TERRORISTS')
+    end)
+    if ok and gh and gh ~= 0 then
+        groupHash = gh
+        pcall(function()
+            local pg = GetHashKey('PLAYER')
+            SetRelationshipBetweenGroups(5, groupHash, pg)
+            SetRelationshipBetweenGroups(5, pg, groupHash)
+        end)
+    else
+        groupHash = GetHashKey('EVENT_TERRORISTS')
+    end
     return groupHash
 end
 
--- ═══════════ SPAWN (server-side, OneSync) ═══════════
+-- ═══════════ SPAWN (v1.0.2: async-safe + pcall per native) ═══════════
 local function spawnEventPeds()
     getGroupHash()
     eventState.npcTotal = 0
@@ -91,27 +110,35 @@ local function spawnEventPeds()
         local ok, ped = safeCall('CreatePed', function()
             return CreatePed(4, modelHash, x, y, z, math.random(360), true, true)
         end)
-        if ok and ped and ped ~= 0 then
-            SetPedRelationshipGroupHash(ped, groupHash)
-            GiveWeaponToPed(ped, weaponHash, 500, false, true)
-            SetPedMaxHealth(ped, Config.NPCs.health)
-            SetEntityHealth(ped, Config.NPCs.health)
-            SetPedArmour(ped, Config.NPCs.armor or 0)
-            SetPedAccuracy(ped, Config.NPCs.accuracy)
-            SetPedCombatAttributes(ped, 46, true)
-            SetPedCombatAttributes(ped, 5, true)
-            SetPedFleeAttributes(ped, 0, false)
 
-            eventState.npcTotal = eventState.npcTotal + 1
-            eventState.pedNetIds[NetworkGetNetworkIdFromEntity(ped)] = true
+        if not (ok and ped and ped ~= 0) then
+            print('^1[qb-gameevent] CreatePed returned invalid handle - check OneSync (see diagnostics)^0')
         else
-            print('^1[qb-gameevent] FAIL: NPC spawn failed - check OneSync + artifacts (see diagnostics)^0')
+            -- [v1.0.2] OneSync: el ped yet-cree async - n-sennou
+            local t = 0
+            while t < 2000 and not DoesEntityExist(ped) do Wait(50) t = t + 50 end
+            if not DoesEntityExist(ped) then
+                print('^1[qb-gameevent] Ped not created after 2s (async fail)^0')
+            else
+                safeCall('SetPedRelationshipGroupHash', function() SetPedRelationshipGroupHash(ped, groupHash) end)
+                safeCall('GiveWeaponToPed', function() GiveWeaponToPed(ped, weaponHash, 500, false, true) end)
+                safeCall('SetPedMaxHealth', function() SetPedMaxHealth(ped, Config.NPCs.health) end)
+                safeCall('SetEntityHealth', function() SetEntityHealth(ped, Config.NPCs.health) end)
+                safeCall('SetPedArmour', function() SetPedArmour(ped, Config.NPCs.armor or 0) end)
+                safeCall('SetPedAccuracy', function() SetPedAccuracy(ped, Config.NPCs.accuracy) end)
+                safeCall('SetPedCombatAttributes', function() SetPedCombatAttributes(ped, 46, true) end)
+                safeCall('SetPedCombatAttributes2', function() SetPedCombatAttributes(ped, 5, true) end)
+                safeCall('SetPedFleeAttributes', function() SetPedFleeAttributes(ped, 0, false) end)
+
+                eventState.npcTotal = eventState.npcTotal + 1
+                eventState.pedNetIds[NetworkGetNetworkIdFromEntity(ped)] = true
+            end
         end
     end
     return eventState.npcTotal
 end
 
--- ═══════════ REGISTER KILL (hardened) ═══════════
+-- ═══════════ REGISTER KILL ═══════════
 local function registerKill(src)
     local now = GetGameTimer()
     if lastKillAt[src] and (now - lastKillAt[src]) < (Config.Security.killRateLimitMs or 400) then
@@ -209,7 +236,7 @@ end)
 -- ═══════════ START EVENT ═══════════
 local function startEvent()
     if eventState.active then
-        print('[qb-gameevent] startEvent blocked: event already active')
+        print('[qb-gameevent] startEvent blocked: already active')
         return
     end
 
@@ -218,31 +245,32 @@ local function startEvent()
     eventState.coords = loc.coords
     eventState.radius = loc.radius
     eventState.label = loc.label
+    eventState.endsAt = os.time() + (Config.Duration or 15) * 60
     eventState.participants = {}
     eventState.startedAt = os.time()
 
     spawnEventPeds()
 
-    if eventState.npcTotal == 0 then
-        print('^1[qb-gameevent] START FAILED: 0 NPCs spawned - event aborted. Check diagnostics in console.^0')
-        eventState.active = false
-        eventState.coords = nil
-        return
-    end
-
     local pedNetIds = {}
     for netId in pairs(eventState.pedNetIds) do pedNetIds[netId] = true end
 
+    -- [v1.0.2] el broadcast dima yetb3ath — 7atta ken 0 NPCs, el zone/timer ybano
+    -- (el NPCs y-configurew client-side 3ala 7sab el fallback)
     TriggerClientEvent('qb-gameevent:client:startEvent', -1, {
         label = loc.label,
         coords = loc.coords,
         radius = loc.radius,
         npcCount = eventState.npcTotal,
         pedNetIds = pedNetIds,
+        endsAt = eventState.endsAt,
     })
 
-    print(('^2[qb-gameevent] Event STARTED at %s (%d NPCs, %d players notified)^0'):format(
-        loc.label, eventState.npcTotal, #QBCore.Functions.GetPlayers()))
+    if eventState.npcTotal == 0 then
+        print('^3[qb-gameevent] WARNING: 0 NPCs spawned (zone visible anyway) - check diagnostics above^0')
+    else
+        print(('^2[qb-gameevent] Event STARTED at %s (%d NPCs, ends in %d min)^0'):format(
+            loc.label, eventState.npcTotal, Config.Duration or 15))
+    end
 
     SetTimeout((Config.Duration or 15) * 60 * 1000, function()
         if eventState.active then endEvent('Time up!') end
@@ -285,6 +313,7 @@ RegisterNetEvent('QBCore:Server:OnPlayerLoaded', function()
         radius = eventState.radius,
         npcCount = eventState.npcTotal - eventState.killed,
         pedNetIds = pedNetIds,
+        endsAt = eventState.endsAt,
     })
 end)
 
